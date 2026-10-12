@@ -1,0 +1,244 @@
+import pytest
+from datetime import datetime, timedelta, timezone
+
+from app.fares import (
+BookingError,
+occupancy_band,
+base_fare,
+fare,
+seats_available,
+refund_rule,
+refund,
+promotion_order,
+promote,
+next_position,
+hold_expiry,
+validate_seats,
+)
+
+# -------------------- Occupancy bands --------------------
+
+@pytest.mark.parametrize(
+"sold, capacity, expected",
+[
+(0, 100, ("quiet", 1.00)),
+(40, 100, ("quiet", 1.00)),
+(41, 100, ("filling", 1.15)),
+(70, 100, ("filling", 1.15)),
+(71, 100, ("busy", 1.35)),
+(90, 100, ("busy", 1.35)),
+(91, 100, ("last_seats", 1.60)),
+(100, 100, ("last_seats", 1.60)),
+(-5, 100, ("quiet", 1.00)),
+],
+)
+def test_occupancy_band(sold, capacity, expected):
+assert occupancy_band(sold, capacity) == expected
+
+@pytest.mark.parametrize("capacity", [0, -1])
+def test_occupancy_band_rejects_invalid_capacity(capacity):
+with pytest.raises(BookingError):
+occupancy_band(0, capacity)
+
+# -------------------- Base fares and fare tiers --------------------
+
+@pytest.mark.parametrize(
+"travel_class, expected",
+[
+("SL", 60.0),
+("3A", 180.0),
+("2A", 250.0),
+("1A", 420.0),
+],
+)
+def test_minimum_fare(travel_class, expected):
+assert base_fare(1, travel_class) == expected
+
+def test_base_fare_uses_distance_and_class_rate():
+assert base_fare(1000, "SL") == 450.0
+assert base_fare(1000, "3A") == 1200.0
+
+def test_class_name_is_case_insensitive():
+assert base_fare(100, "sl") == base_fare(100, "SL")
+
+@pytest.mark.parametrize("travel_class", ["XX", "", "UNKNOWN"])
+def test_unknown_class_is_rejected(travel_class):
+with pytest.raises(BookingError):
+base_fare(100, travel_class)
+
+def test_negative_distance_is_rejected():
+with pytest.raises(BookingError):
+base_fare(-1, "SL")
+
+def test_fare_multiplier_applies_to_base_fare():
+result = fare(1000, "SL", 91, 100)
+assert result == {
+"fare": 720,
+"band": "last_seats",
+"multiplier": 1.60,
+"base": 450,
+"class": "SL",
+"class_name": "Sleeper",
+}
+
+def test_fare_rounds_half_up():
+# Minimum SL fare of 60, multiplied by 1.15 = 69.
+result = fare(1, "SL", 41, 100)
+assert result["fare"] == 69
+
+# -------------------- Seat availability --------------------
+
+@pytest.mark.parametrize(
+"capacity, confirmed, holds, expected",
+[
+(100, 40, 10, 50),
+(10, 10, 0, 0),
+(10, 8, 5, 0),
+(10, 0, 0, 10),
+],
+)
+def test_seats_available(capacity, confirmed, holds, expected):
+assert seats_available(capacity, confirmed, holds) == expected
+
+# -------------------- Refund rules --------------------
+
+@pytest.mark.parametrize(
+"hours, expected_fraction",
+[
+(72, 1.00),
+(48, 1.00),
+(47.99, 0.75),
+(24, 0.75),
+(23.99, 0.50),
+(12, 0.50),
+(11.99, 0.25),
+(4, 0.25),
+(3.99, 0.00),
+(0, 0.00),
+(-1, 0.00),
+],
+)
+def test_refund_rule_boundaries(hours, expected_fraction):
+fraction, _ = refund_rule(hours)
+assert fraction == expected_fraction
+
+@pytest.mark.parametrize(
+"hours, expected_refund",
+[
+(48, 970),
+(24, 720),
+(12, 470),
+(4, 220),
+(3, 0),
+(-1, 0),
+],
+)
+def test_refund_amount_at_boundaries(hours, expected_refund):
+now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+departure = now + timedelta(hours=hours)
+
+```
+result = refund(1000, departure, now)
+assert result["refund"] == expected_refund
+```
+
+def test_waitlisted_ticket_gets_full_refund():
+now = datetime.now(timezone.utc)
+result = refund(
+500,
+now + timedelta(hours=2),
+now,
+status="WAITLISTED",
+)
+assert result["refund"] == 500
+assert result["clerkage"] == 0
+
+def test_refund_never_becomes_negative():
+now = datetime.now(timezone.utc)
+result = refund(10, now + timedelta(hours=48), now)
+assert result["refund"] == 0
+
+def test_negative_ticket_price_is_rejected():
+now = datetime.now(timezone.utc)
+with pytest.raises(BookingError):
+refund(-1, now + timedelta(hours=48), now)
+
+# -------------------- Waiting-list ordering --------------------
+
+def test_promotion_order_is_per_class_and_position():
+waitlist = [
+{"id": 4, "travel_class": "SL", "position": 2, "seats": 1},
+{"id": 2, "travel_class": "3A", "position": 1, "seats": 1},
+{"id": 3, "travel_class": "SL", "position": 1, "seats": 1},
+]
+
+```
+result = promotion_order(waitlist, "SL")
+assert [entry["id"] for entry in result] == [3, 4]
+```
+
+def test_promotion_order_breaks_position_ties_by_id():
+waitlist = [
+{"id": 8, "travel_class": "SL", "position": 1, "seats": 1},
+{"id": 3, "travel_class": "SL", "position": 1, "seats": 1},
+]
+assert [e["id"] for e in promotion_order(waitlist, "SL")] == [3, 8]
+
+def test_promote_mixed_classes_and_party_sizes():
+waitlist = [
+{"id": 1, "travel_class": "SL", "position": 1, "seats": 3},
+{"id": 2, "travel_class": "SL", "position": 2, "seats": 1},
+{"id": 3, "travel_class": "3A", "position": 1, "seats": 1},
+{"id": 4, "travel_class": "SL", "position": 3, "seats": 2},
+]
+
+```
+promoted, remaining = promote(waitlist, "SL", 2)
+
+assert [entry["id"] for entry in promoted] == [2]
+assert promoted[0]["status"] == "CONFIRMED"
+
+sleeper_remaining = [
+    entry for entry in remaining if entry["travel_class"] == "SL"
+]
+assert [(entry["id"], entry["position"]) for entry in sleeper_remaining] == [
+    (1, 1),
+    (4, 2),
+]
+
+# The other class is untouched.
+ac_remaining = [entry for entry in remaining if entry["travel_class"] == "3A"]
+assert ac_remaining == [
+    {"id": 3, "travel_class": "3A", "position": 1, "seats": 1}
+]
+```
+
+def test_promote_empty_queue():
+assert promote([], "SL", 2) == ([], [])
+
+def test_promote_rejects_negative_freed_seats():
+with pytest.raises(BookingError):
+promote([], "SL", -1)
+
+def test_next_position_is_per_class():
+waitlist = [
+{"id": 1, "travel_class": "SL", "position": 1, "seats": 1},
+{"id": 2, "travel_class": "3A", "position": 1, "seats": 1},
+]
+assert next_position(waitlist, "SL") == 2
+assert next_position(waitlist, "2A") == 1
+
+# -------------------- Holds and booking validation --------------------
+
+def test_hold_expiry():
+now = datetime(2026, 10, 9, 12, tzinfo=timezone.utc)
+assert hold_expiry(now) == now + timedelta(seconds=300)
+
+@pytest.mark.parametrize("seats, expected", [(1, 1), (3, 3), (6, 6), ("2", 2)])
+def test_validate_seats(seats, expected):
+assert validate_seats(seats) == expected
+
+@pytest.mark.parametrize("seats", [0, -1, 7, "abc", None])
+def test_validate_seats_rejects_invalid_values(seats):
+with pytest.raises(BookingError):
+validate_seats(seats)
