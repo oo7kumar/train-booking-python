@@ -1,8 +1,21 @@
-
-
 version: 2.1
 
 jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install Ruff
+          command: python -m pip install ruff==0.17.0
+
+      - run:
+          name: Check code quality
+          command: python -m ruff check .
+
   test:
     docker:
       - image: cimg/python:3.12
@@ -18,8 +31,8 @@ jobs:
             pip install pytest
 
       - run:
-          name: Run Python tests
-          command: python -m pytest tests/test_fares.py -v
+          name: Run all Python tests
+          command: python -m pytest -v
 
   docker-build:
     docker:
@@ -37,7 +50,10 @@ jobs:
 workflows:
   train-booking-ci:
     jobs:
-      - test
+      - lint
+      - test:
+          requires:
+            - lint
       - docker-build:
           requires:
             - test
