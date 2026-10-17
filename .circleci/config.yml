@@ -31,8 +31,80 @@ jobs:
             pip install pytest
 
       - run:
-          name: Run all Python tests
+          name: Run unit tests
           command: python -m pytest -v
+
+  integration-test:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://trainuser:localdevpassword@postgres:5432/trainbooking
+          REDIS_URL: redis://redis:6379/0
+
+      - image: postgres:16
+        name: postgres
+        environment:
+          POSTGRES_DB: trainbooking
+          POSTGRES_USER: trainuser
+          POSTGRES_PASSWORD: localdevpassword
+
+      - image: redis:7-alpine
+        name: redis
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install pytest
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+
+      - run:
+          name: Wait for PostgreSQL and Redis
+          command: |
+            for i in $(seq 1 30); do
+              if pg_isready -h postgres -p 5432 -U trainuser -d trainbooking; then
+                break
+              fi
+              sleep 2
+            done
+
+            pg_isready -h postgres -p 5432 -U trainuser -d trainbooking
+
+            python - <<'PY'
+            import os
+            import time
+            import redis
+
+            client = redis.Redis.from_url(os.environ["REDIS_URL"])
+
+            for attempt in range(30):
+                try:
+                    client.ping()
+                    print("Redis is ready")
+                    break
+                except redis.RedisError:
+                    if attempt == 29:
+                        raise
+                    time.sleep(2)
+            PY
+
+      - run:
+          name: Apply database migrations
+          command: |
+            export PGPASSWORD=localdevpassword
+            psql -h postgres -U trainuser -d trainbooking \
+              -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql -h postgres -U trainuser -d trainbooking \
+              -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
+
+      - run:
+          name: Run integration tests
+          command: python -m pytest tests/test_integration.py -v
 
   docker-build:
     docker:
@@ -51,9 +123,15 @@ workflows:
   train-booking-ci:
     jobs:
       - lint
+
       - test:
           requires:
             - lint
-      - docker-build:
+
+      - integration-test:
           requires:
             - test
+
+      - docker-build:
+          requires:
+            - integration-test
